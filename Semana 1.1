@@ -1,0 +1,79 @@
+// --- CONFIGURACIÓN DE PINES ---
+const int PIN_MONEDERO = 18; // Entrada real del monedero
+const int PIN_B1 = 4;        // Botón Moneda $1
+const int PIN_B2 = 5;        // Botón Moneda $2
+const int PIN_B5 = 13;       // Botón Moneda $5
+const int PIN_B10 = 12;      // Botón Moneda $10
+
+// --- VARIABLES DE CONTROL ---
+volatile int pulsos = 0;
+volatile unsigned long ultimoTiempo = 0;
+volatile bool monedaDetectada = false;
+
+float dineroTotal = 0.0;
+const float VALOR_POR_PULSO = 1.0; // 1 pulso = $1 peso
+const int TIEMPO_REBOTE = 35;      // Milisegundos para evitar ruido
+
+// Interrupción para el monedero real
+void IRAM_ATTR ISR_moneda() {
+  unsigned long tiempoActual = millis();
+  if (tiempoActual - ultimoTiempo > TIEMPO_REBOTE) {
+    pulsos++;
+    monedaDetectada = true;
+    ultimoTiempo = tiempoActual;
+  }
+}
+
+void setup() {
+  Serial.begin(115200);
+
+  // Configuración del monedero real
+  pinMode(PIN_MONEDERO, INPUT_PULLUP);
+  attachInterrupt(digitalPinToInterrupt(PIN_MONEDERO), ISR_moneda, FALLING);
+
+  // Configuración de los 4 botones (Simulación)
+  pinMode(PIN_B1, INPUT_PULLUP);
+  pinMode(PIN_B2, INPUT_PULLUP);
+  pinMode(PIN_B5, INPUT_PULLUP);
+  pinMode(PIN_B10, INPUT_PULLUP);
+
+  Serial.println("--- SISTEMA MULTI-MONEDA INICIADO ---");
+  Serial.println("Esperando entrada (Pin 18 o Botones)...");
+}
+
+void loop() {
+  // --- SIMULACIÓN POR BOTONES ---
+  if (digitalRead(PIN_B1) == LOW) { inyectarPulsos(1); }
+  if (digitalRead(PIN_B2) == LOW) { inyectarPulsos(2); }
+  if (digitalRead(PIN_B5) == LOW) { inyectarPulsos(5); }
+  if (digitalRead(PIN_B10) == LOW) { inyectarPulsos(10); }
+
+  // --- PROCESAMIENTO DE SALDO ---
+  if (monedaDetectada) {
+    delay(300); // Espera a que la moneda termine de dar sus pulsos
+    
+    noInterrupts();
+    int pulsosRecibidos = pulsos;
+    pulsos = 0;
+    monedaDetectada = false;
+    interrupts();
+
+    float depositoActual = pulsosRecibidos * VALOR_POR_PULSO;
+    dineroTotal += depositoActual;
+
+    Serial.println("********************************");
+    Serial.printf("Pulsos de moneda: %d\n", pulsosRecibidos);
+    Serial.printf("Ingresó: $%.2f\n", depositoActual);
+    Serial.printf("TOTAL EN CAJA: $%.2f\n", dineroTotal);
+    Serial.println("********************************\n");
+  }
+}
+
+// Función auxiliar para simular los pulsos de los botones
+void inyectarPulsos(int cantidad) {
+  noInterrupts();
+  pulsos += cantidad;
+  monedaDetectada = true;
+  interrupts();
+  delay(300); // Debounce para no contar la misma presión varias veces
+}
