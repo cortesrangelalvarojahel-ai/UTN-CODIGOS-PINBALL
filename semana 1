@@ -1,0 +1,72 @@
+volatile int saldo = 0;
+
+volatile unsigned long tiempo1 = 0;
+volatile unsigned long tiempo2 = 0;
+volatile unsigned long tiempo5 = 0;
+volatile unsigned long tiempo10 = 0;
+
+// Moneda de $1
+void IRAM_ATTR moneda1() {
+
+  if (millis() - tiempo1 > 200) {
+    saldo += 1;
+    tiempo1 = millis();
+  }
+}
+
+// Moneda de $2
+void IRAM_ATTR moneda2() {
+
+  if (millis() - tiempo2 > 200) {
+    saldo += 2;
+    tiempo2 = millis();
+  }
+}
+
+// Moneda de $5
+void IRAM_ATTR moneda5() {
+
+  if (millis() - tiempo5 > 200) {
+    saldo += 5;
+    tiempo5 = millis();
+  }
+}
+
+// Moneda de $10
+void IRAM_ATTR moneda10() {
+
+  if (millis() - tiempo10 > 200) {
+    saldo += 10;
+    tiempo10 = millis();
+  }
+}
+
+void setup() {
+
+  Serial.begin(115200);
+
+  pinMode(18, INPUT_PULLUP);
+  pinMode(19, INPUT_PULLUP);
+  pinMode(21, INPUT_PULLUP);
+  pinMode(22, INPUT_PULLUP);
+
+  attachInterrupt(digitalPinToInterrupt(18), moneda1, FALLING);
+  attachInterrupt(digitalPinToInterrupt(19), moneda2, FALLING);
+  attachInterrupt(digitalPinToInterrupt(21), moneda5, FALLING);
+  attachInterrupt(digitalPinToInterrupt(22), moneda10, FALLING);
+
+  Serial.println("Monedero iniciado");
+}
+
+void loop() {
+
+  static int ultimoSaldo = -1;
+
+  if (saldo != ultimoSaldo) {
+
+    Serial.print("Saldo actual: $");
+    Serial.println(saldo);
+
+    ultimoSaldo = saldo;
+  }
+}
