@@ -1,0 +1,132 @@
+#include <Wire.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_SSD1306.h>
+#include <ArduinoJson.h>
+
+
+#define SCREEN_WIDTH 128
+#define SCREEN_HEIGHT 64
+#define OLED_RESET    -1
+Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
+
+
+const int PIN_M1 = 4;
+const int PIN_M2 = 5;
+const int PIN_M5 = 13;
+const int PIN_M10 = 12;
+const int PIN_HOPPER_LED = 23;
+
+
+volatile int saldoTotal = 0;
+volatile int ultimaMoneda = 0;
+volatile bool monedaIngresada = false;
+
+
+volatile unsigned long ultimoTiempoInterrupcion = 0;
+const int debounceDelay = 250; 
+
+
+void IRAM_ATTR manejarMoneda(int valor) {
+  unsigned long tiempoActual = millis();
+  if (tiempoActual - ultimoTiempoInterrupcion > debounceDelay) {
+    saldoTotal += valor;
+    ultimaMoneda = valor;
+    monedaIngresada = true;
+    ultimoTiempoInterrupcion = tiempoActual;
+  }
+}
+
+
+void IRAM_ATTR isr1() { manejarMoneda(1); }
+void IRAM_ATTR isr2() { manejarMoneda(2); }
+void IRAM_ATTR isr5() { manejarMoneda(5); }
+void IRAM_ATTR isr10() { manejarMoneda(10); }
+
+void setup() {
+  Serial.begin(115200);
+
+ 
+  if(!display.begin(SSD1306_SWITCHCAPVCC, 0x3C)) { 
+    Serial.println(F("Error: SSD1306 no detectado"));
+    
+  }
+  
+  display.clearDisplay();
+  display.setTextColor(SSD1306_WHITE);
+  actualizarPantalla("SISTEMA LISTO", 0);
+
+ 
+  pinMode(PIN_HOPPER_LED, OUTPUT);
+  digitalWrite(PIN_HOPPER_LED, LOW);
+
+  pinMode(PIN_M1, INPUT_PULLUP);
+  pinMode(PIN_M2, INPUT_PULLUP);
+  pinMode(PIN_M5, INPUT_PULLUP);
+  pinMode(PIN_M10, INPUT_PULLUP);
+
+ 
+  attachInterrupt(digitalPinToInterrupt(PIN_M1), isr1, FALLING);
+  attachInterrupt(digitalPinToInterrupt(PIN_M2), isr2, FALLING);
+  attachInterrupt(digitalPinToInterrupt(PIN_M5), isr5, FALLING);
+  attachInterrupt(digitalPinToInterrupt(PIN_M10), isr10, FALLING);
+
+  Serial.println("========================================");
+  Serial.println("MOCKUP FIREBASE - PINBALL ACTIVADO");
+  Serial.println("========================================");
+}
+
+void loop() {
+  if (monedaIngresada) {
+   
+    digitalWrite(PIN_HOPPER_LED, HIGH);
+    
+    
+    enviarJsonMock(ultimaMoneda);
+    
+    
+    actualizarPantalla("MONEDA OK", saldoTotal);
+
+   
+    delay(500); 
+    digitalWrite(PIN_HOPPER_LED, LOW);
+    
+    monedaIngresada = false;
+    actualizarPantalla("ESPERANDO...", saldoTotal);
+  }
+}
+
+void enviarJsonMock(int valor) {
+  StaticJsonDocument<200> doc;
+  
+  
+  doc["dispositivo"] = "pinball_01";
+  doc["tipo"] = "ingreso";
+  doc["valor"] = (float)valor;
+  doc["timestamp"] = String(millis()); 
+
+  serializeJsonPretty(doc, Serial);
+  Serial.println(); 
+}
+
+void actualizarPantalla(String estado, int total) {
+  display.clearDisplay();
+  
+ 
+  display.setTextSize(1);
+  display.setCursor(0, 0);
+  display.println("EQUIPO - PINBALL");
+  display.drawFastHLine(0, 12, 128, SSD1306_WHITE);
+
+  
+  display.setCursor(0, 20);
+  display.print("STATUS: ");
+  display.println(estado);
+
+  // Saldo
+  display.setCursor(0, 40);
+  display.setTextSize(2);
+  display.print("  $");
+  display.print(total);
+
+  display.display(); 
+}
