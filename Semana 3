@@ -1,0 +1,161 @@
+#include <Wire.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_SSD1306.h>
+#include <ArduinoJson.h>
+
+#define SCREEN_WIDTH 128
+#define SCREEN_HEIGHT 64
+#define OLED_RESET    -1
+Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
+
+// Pines del sistema
+const int PIN_M1 = 4;
+const int PIN_M2 = 5;
+const int PIN_M5 = 13;
+const int PIN_M10 = 12;
+const int PIN_HOPPER_LED = 23;
+
+// Variables volátiles para comunicación con las ISR (Interrupciones)
+volatile int saldoTotal = 0;
+volatile int ultimaMoneda = 0;
+volatile bool monedaIngresada = false;
+
+// Monitoreo de rebote (Debounce) individual por moneda
+volatile unsigned long ultimosTiempos[4] = {0, 0, 0, 0};
+const int debounceDelay = 250; 
+
+// Control del LED del Hopper mediante tiempos (Sustituye al delay)
+unsigned long tiempoApagarLED = 0;
+bool ledEncendido = false;
+
+// Candado de seguridad (Mutex) para evitar colisiones de datos en el ESP32
+portMUX_TYPE myMutex = portMUX_INITIALIZER_UNLOCKED;
+
+// Función genérica que procesa la interrupción de cualquier moneda
+void IRAM_ATTR manejarMoneda(int valor, int indice) {
+  unsigned long tiempoActual = millis();
+  
+  if (tiempoActual - ultimosTiempos[indice] > debounceDelay) {
+    portENTER_CRITICAL_ISR(&myMutex); // Abre sección crítica en la ISR
+    saldoTotal += valor;
+    ultimaMoneda = valor;
+    monedaIngresada = true;
+    portEXIT_CRITICAL_ISR(&myMutex);  // Cierra sección crítica
+    
+    ultimosTiempos[indice] = tiempoActual;
+  }
+}
+
+// Funciones ISR asociadas a cada pin físico
+void IRAM_ATTR isr1() { manejarMoneda(1, 0); }
+void IRAM_ATTR isr2() { manejarMoneda(2, 1); }
+void IRAM_ATTR isr5() { manejarMoneda(5, 2); }
+void IRAM_ATTR isr10() { manejarMoneda(10, 3); }
+
+void setup() {
+  Serial.begin(115200);
+
+  // Inicialización de la pantalla OLED
+  if(!display.begin(SSD1306_SWITCHCAPVCC, 0x3C)) { 
+    Serial.println(F("Error: SSD1306 no detectado"));
+  }
+  
+  display.clearDisplay();
+  display.setTextColor(SSD1306_WHITE);
+  actualizarPantalla("SISTEMA LISTO", 0);
+
+  // Configuración de Pines
+  pinMode(PIN_HOPPER_LED, OUTPUT);
+  digitalWrite(PIN_HOPPER_LED, LOW);
+
+  pinMode(PIN_M1, INPUT_PULLUP);
+  pinMode(PIN_M2, INPUT_PULLUP);
+  pinMode(PIN_M5, INPUT_PULLUP);
+  pinMode(PIN_M10, INPUT_PULLUP);
+
+  // Enlace de interrupciones por flanco de bajada (FALLING)
+  attachInterrupt(digitalPinToInterrupt(PIN_M1), isr1, FALLING);
+  attachInterrupt(digitalPinToInterrupt(PIN_M2), isr2, FALLING);
+  attachInterrupt(digitalPinToInterrupt(PIN_M5), isr5, FALLING);
+  attachInterrupt(digitalPinToInterrupt(PIN_M10), isr10, FALLING);
+
+  Serial.println("========================================");
+  Serial.println("MOCKUP FIREBASE - PINBALL ACTIVADO");
+  Serial.println("========================================");
+}
+
+void loop() {
+  // Variables locales para resguardar copias seguras de los datos volátiles
+  bool copiaMonedaIngresada = false;
+  int copiaUltimaMoneda = 0;
+  int copiaSaldoTotal = 0;
+
+  // --- SECCIÓN CRÍTICA ---
+  // Bloqueo ultra rápido para copiar datos y liberar la interrupción
+  portENTER_CRITICAL(&myMutex);
+  copiaMonedaIngresada = monedaIngresada;
+  if (copiaMonedaIngresada) {
+    copiaUltimaMoneda = ultimaMoneda;
+    copiaSaldoTotal = saldoTotal;
+    monedaIngresada = false; // Flag reseteado de inmediato
+  }
+  portEXIT_CRITICAL(&myMutex);
+  // ------------------------
+
+  // ACCIÓN 1: Se detectó una nueva moneda
+  if (copiaMonedaIngresada) {
+    digitalWrite(PIN_HOPPER_LED, HIGH); // Encendemos el LED
+    ledEncendido = true;
+    tiempoApagarLED = millis() + 500;   // Programamos el apagado en 500ms a futuro
+    
+    enviarJsonMock(copiaUltimaMoneda);
+    actualizarPantalla("MONEDA OK", copiaSaldoTotal);
+  }
+
+  // ACCIÓN 2: El temporizador asíncrono revisa si ya pasaron los 500ms del LED
+  if (ledEncendido && millis() >= tiempoApagarLED) {
+    digitalWrite(PIN_HOPPER_LED, LOW); // Apagamos el LED sin detener el loop
+    ledEncendido = false;
+    
+    // Obtenemos el saldo actual de forma segura para refrescar la pantalla por "ESPERANDO..."
+    portENTER_CRITICAL(&myMutex);
+    copiaSaldoTotal = saldoTotal;
+    portEXIT_CRITICAL(&myMutex);
+    
+    actualizarPantalla("ESPERANDO...", copiaSaldoTotal);
+  }
+}
+
+// Función para emular el envío de JSON
+void enviarJsonMock(int valor) {
+  StaticJsonDocument<200> doc;
+  
+  doc["dispositivo"] = "pinball_01";
+  doc["tipo"] = "ingreso";
+  doc["valor"] = valor; 
+  doc["timestamp"] = millis(); // Almacenar como entero nativo evita fragmentar la RAM
+
+  serializeJsonPretty(doc, Serial);
+  Serial.println(); 
+}
+
+// Control de interfaz gráfica en la pantalla OLED
+void actualizarPantalla(String estado, int total) {
+  display.clearDisplay();
+  
+  display.setTextSize(1);
+  display.setCursor(0, 0);
+  display.println("EQUIPO - PINBALL");
+  display.drawFastHLine(0, 12, 128, SSD1306_WHITE);
+
+  display.setCursor(0, 20);
+  display.print("STATUS: ");
+  display.println(estado);
+
+  display.setCursor(0, 40);
+  display.setTextSize(2);
+  display.print("  $");
+  display.print(total);
+
+  display.display(); 
+}
