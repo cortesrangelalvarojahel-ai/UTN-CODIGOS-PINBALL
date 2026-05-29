@@ -1,0 +1,124 @@
+#include <Wire.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_SSD1306.h>
+
+#define SCREEN_WIDTH 128
+#define SCREEN_HEIGHT 64
+#define OLED_RESET    -1
+Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
+
+// Pines de los botones
+const int PIN_M1 = 4;
+const int PIN_M2 = 5;
+const int PIN_M13 = 13; // Cambiado el nombre visual para mantener orden
+const int PIN_M12 = 12;
+const int PIN_HOPPER_LED = 23;
+
+// Variables de control del Hopper
+int monedasPorEntregar = 0;   
+int monedasEntregadas = 0;    
+bool hopperActivo = false;    
+
+// MODIFICACIÓN: Ahora empieza en $0 y acumulará todo lo que salga
+int dineroTotalEntregado = 0; 
+
+unsigned long tiempoUltimaSalida = 0; 
+const int velocidadHopper = 600;      
+
+void setup() {
+  Serial.begin(115200);
+
+  if(!display.begin(SSD1306_SWITCHCAPVCC, 0x3C)) { 
+    Serial.println(F("Error: SSD1306 no detectado"));
+  }
+  
+  display.clearDisplay();
+  display.setTextColor(SSD1306_WHITE);
+  actualizarPantalla("SISTEMA LISTO", 0);
+
+  pinMode(PIN_HOPPER_LED, OUTPUT);
+  digitalWrite(PIN_HOPPER_LED, LOW); 
+
+  pinMode(PIN_M1, INPUT_PULLUP);
+  pinMode(PIN_M2, INPUT_PULLUP);
+  pinMode(PIN_M13, INPUT_PULLUP);
+  pinMode(PIN_M12, INPUT_PULLUP);
+
+  imprimirEstadoCaja("SISTEMA LISTO");
+}
+
+void loop() {
+  // Escaneo de botones
+  if (digitalRead(PIN_M1) == LOW && !hopperActivo) { iniciarEntregaHopper(1); delay(200); }
+  else if (digitalRead(PIN_M2) == LOW && !hopperActivo) { iniciarEntregaHopper(2); delay(200); }
+  else if (digitalRead(PIN_M13) == LOW && !hopperActivo) { iniciarEntregaHopper(5); delay(200); }
+  else if (digitalRead(PIN_M12) == LOW && !hopperActivo) { iniciarEntregaHopper(10); delay(200); }
+
+  // Control del Hopper
+  if (hopperActivo) {
+    unsigned long tiempoActual = millis();
+
+    if (tiempoActual - tiempoUltimaSalida >= velocidadHopper) {
+      monedasEntregadas++;      
+      monedasPorEntregar--;     
+      
+      // MODIFICACIÓN: En lugar de restar, sumamos al contador histórico
+      dineroTotalEntregado++; 
+      
+      tiempoUltimaSalida = tiempoActual;
+
+      // Actualizar Pantalla Física
+      actualizarPantalla("PAGANDO...", monedasEntregadas);
+      
+      // Mostrar en el Monitor Serie
+      imprimirEstadoCaja("PROCESANDO PAGO");
+
+      // Cierre de ciclo
+      if (monedasPorEntregar <= 0) {
+        digitalWrite(PIN_HOPPER_LED, LOW); 
+        hopperActivo = false;
+        actualizarPantalla("PAGO OK", monedasEntregadas);
+        imprimirEstadoCaja("PAGO COMPLETADO");
+      }
+    }
+  }
+}
+
+void iniciarEntregaHopper(int cantidad) {
+  monedasPorEntregar = cantidad;
+  monedasEntregadas = 0;
+  hopperActivo = true;
+  tiempoUltimaSalida = millis();
+
+  digitalWrite(PIN_HOPPER_LED, HIGH); 
+  actualizarPantalla("INICIANDO", 0);
+  imprimirEstadoCaja("INICIANDO PAGO");
+}
+
+void imprimirEstadoCaja(String evento) {
+  Serial.println("\n========================================");
+  Serial.print(" EVENTO: "); Serial.println(evento);
+  Serial.println("----------------------------------------");
+  Serial.print("  -> Monedas Entregadas (OUT): "); Serial.println(monedasEntregadas);
+  Serial.print("  -> Monedas por Entregar:     "); Serial.println(monedasPorEntregar);
+  
+  // MODIFICACIÓN: Texto cambiado para reflejar el gran total acumulado
+  Serial.print("  -> TOTAL ENTREGADO HISTORICO: $"); Serial.println(dineroTotalEntregado);
+  Serial.println("========================================");
+}
+
+void actualizarPantalla(String estado, int conteoMonedas) {
+  display.clearDisplay();
+  display.setTextSize(1);
+  display.setCursor(0, 0);
+  display.println("EQUIPO PINBALL - W4");
+  display.drawFastHLine(0, 12, 128, SSD1306_WHITE);
+
+  display.setCursor(0, 22);
+  display.print("HOPPER: "); display.println(estado);
+
+  display.setCursor(0, 42);
+  display.setTextSize(2);
+  display.print("OUT: "); display.print(conteoMonedas);
+  display.display(); 
+}
