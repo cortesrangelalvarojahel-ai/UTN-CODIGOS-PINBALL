@@ -1,0 +1,219 @@
+/*
+ * PINBALL SEMANA 7 - VALIDACIÓN FÍSICA DEL HOPPER
+ * ESP32 + HTTP WIFI (Cliente Asíncrono para Nakamura Logistic)
+ * * Cambio de lógica: El LED del Hopper ya no se apaga por tiempo (millis).
+ * Ahora se apaga de forma inmediata al presionar el botón de validación en el PIN 18.
+ */
+
+#include <Arduino.h>
+#include <WiFi.h>
+#include <Wire.h>
+
+//================ CONFIGURACION ================
+#define PIN_MONEDA 4
+#define PIN_GABINETE 19
+#define PIN_HOPPER 23
+#define PIN_VALIDACION_HOPPER 18 // <--- Nuevo botón de confirmación física
+
+const char* SSID = "Wokwi-GUEST";
+const char* PASSWORD = "";
+
+// Configuración del Endpoint de Destino
+const char* NAKAMURA_HOST = "nakamura.logistic.com";
+const int NAKAMURA_PUERTO = 80;
+
+WiFiClient clienteRed;
+
+//================ VARIABLES ================
+volatile bool monedaDetectada = false;
+volatile bool posiblePesca = false;
+volatile unsigned long ultimoPulso = 0;
+volatile unsigned long duracionPulso = 0;
+
+bool hopperActivo = false;
+bool bloqueoFraude = false;
+bool gabineteAbierto = false;
+
+int totalDinero = 0; 
+String estado = "CLEAN";
+
+unsigned long tiempoFraude = 0;
+bool solicitarEnvioTelemetria = false; 
+
+#define BLOQUEO 2000
+
+//================ REPORTE IMPRESO ================
+void reporte(String evento){
+    Serial.println();
+    Serial.println("================================");
+    Serial.print("EVENTO: ");    Serial.println(evento);
+    Serial.print("DINERO TOTAL: $"); Serial.println(totalDinero);
+    Serial.print("HOPPER (LED): ");    Serial.println(digitalRead(PIN_HOPPER) == HIGH ? "ENCENDIDO" : "APAGADO");
+    Serial.print("GABINETE: ");  Serial.println(gabineteAbierto ? "ABIERTO" : "CERRADO");
+    Serial.print("SEGURIDAD: ");  Serial.println(estado);
+    Serial.println("================================");
+}
+
+//================ HTTP CLIENTE (TELEMETRÍA ASÍNCRONA POR EVENTO) ================
+void enviarTelemetriaNakamura() {
+    if (WiFi.status() != WL_CONNECTED) return; 
+
+    if (clienteRed.connect(NAKAMURA_HOST, NAKAMURA_PUERTO)) {
+        String jsonPayload = "{";
+        jsonPayload += "\"dinero\":" + String(totalDinero) + ",";
+        jsonPayload += "\"estado\":\"" + estado + "\",";
+        jsonPayload += "\"gabinete\":\"" + String(gabineteAbierto ? "ABIERTO" : "CERRADO") + "\"";
+        jsonPayload += "}";
+
+        clienteRed.println("POST /api/telemetria HTTP/1.1");
+        clienteRed.print("Host: "); clienteRed.println(NAKAMURA_HOST);
+        clienteRed.println("Content-Type: application/json");
+        clienteRed.print("Content-Length: "); clienteRed.println(jsonPayload.length());
+        clienteRed.println();
+        clienteRed.println(jsonPayload);
+        clienteRed.stop(); 
+
+        Serial.println("[TELEMETRÍA IOT]: Reporte transmitido al endpoint Nakamura Logistic.");
+    } else {
+        Serial.println("[TELEMETRÍA SIMULADA]: Paquete único de evento enviado a Nakamura.");
+    }
+}
+
+//================ INTERRUPCION MONEDA ================
+void IRAM_ATTR monedaISR(){
+    unsigned long ahora = millis();
+
+    if (estado != "CLEAN" || hopperActivo) return;
+
+    unsigned long tiempoTranscurrido = ahora - ultimoPulso;
+
+    if (tiempoTranscurrido < 100 && ultimoPulso != 0) {
+        duracionPulso = tiempoTranscurrido;
+        posiblePesca = true;
+        return;
+    }
+
+    duracionPulso = tiempoTranscurrido;
+    monedaDetectada = true;
+    ultimoPulso = ahora;
+}
+
+//================ SETUP ================
+void setup(){
+    Serial.begin(115200);
+
+    pinMode(PIN_MONEDA, INPUT_PULLUP);
+    pinMode(PIN_GABINETE, INPUT_PULLUP);
+    pinMode(PIN_VALIDACION_HOPPER, INPUT_PULLUP); // <--- Configurado con Pull-Up
+    pinMode(PIN_HOPPER, OUTPUT);
+
+    digitalWrite(PIN_HOPPER, LOW);
+
+    attachInterrupt(digitalPinToInterrupt(PIN_MONEDA), monedaISR, FALLING);
+
+    Wire.begin(21,22);
+
+    Serial.println("Conectando WIFI...");
+    WiFi.mode(WIFI_STA);
+    WiFi.begin(SSID, PASSWORD);
+
+    reporte("SISTEMA INICIADO");
+    solicitarEnvioTelemetria = true; 
+}
+
+//================ LOOP PRINCIPAL ================
+void loop(){
+    unsigned long ahora = millis();
+
+    //========= BOTON ROJO TOGGLE (GABINETE) =========
+    static bool anteriorBotonGabinete = HIGH;
+    static unsigned long tiempoGabinete = 0;
+    bool botonGabinete = digitalRead(PIN_GABINETE);
+
+    if (botonGabinete == LOW && anteriorBotonGabinete == HIGH) {
+        if (ahora - tiempoGabinete > 150) { 
+            if (!gabineteAbierto) {
+                gabineteAbierto = true;
+                estado = "INTRUSION";
+                digitalWrite(PIN_HOPPER, LOW);
+                hopperActivo = false;
+                monedaDetectada = false;
+
+                reporte("GABINETE ABIERTO - SISTEMA BLOQUEADO");
+            } else {
+                gabineteAbierto = false;
+                estado = "CLEAN";
+                bloqueoFraude = false;
+                posiblePesca = false;
+                monedaDetectada = false;
+                ultimoPulso = ahora; 
+
+                reporte("GABINETE CERRADO - SISTEMA ACTIVO");
+            }
+            solicitarEnvioTelemetria = true; 
+            tiempoGabinete = ahora;
+        }
+    }
+    anteriorBotonGabinete = botonGabinete;
+
+    // Lógica operativa si el gabinete está cerrado
+    if (estado != "INTRUSION") {
+
+        //========= MONEDA DETECTADA (BOTÓN VERDE) ==========
+        if (monedaDetectada && !gabineteAbierto) {
+            monedaDetectada = false;
+            totalDinero++; 
+            digitalWrite(PIN_HOPPER, HIGH); // Enciende el LED inmediatamente
+            hopperActivo = true;
+
+            reporte("MONEDA ACEPTADA -> HOPPER ESPERANDO VALIDACIÓN");
+            solicitarEnvioTelemetria = true; 
+        }
+
+        //========= NUEVA LÓGICA: CONFIRMACIÓN DEL HOPPER (PIN 18) ==========
+        static bool anteriorBotonValidacion = HIGH;
+        static unsigned long tiempoValidacion = 0;
+        bool botonValidacion = digitalRead(PIN_VALIDACION_HOPPER);
+
+        // Si el Hopper está activo y presionas el botón del Pin 18
+        if (hopperActivo && botonValidacion == LOW && anteriorBotonValidacion == HIGH) {
+            if (ahora - tiempoValidacion > 150) { // Antirrebote sin delay
+                digitalWrite(PIN_HOPPER, LOW);   // ¡Apaga el LED al instante!
+                hopperActivo = false;
+
+                reporte("PAGO ENTREGADO Y CONFIRMADO POR SENSOR (PIN 18)");
+                tiempoValidacion = ahora;
+            }
+        }
+        anteriorBotonValidacion = botonValidacion;
+
+        //========= FRAUDE ==========
+        if (posiblePesca && !bloqueoFraude) {
+            posiblePesca = false;
+            bloqueoFraude = true;
+            estado = "FRAUDE";
+            digitalWrite(PIN_HOPPER, LOW);
+            tiempoFraude = ahora;
+
+            reporte("FRAUDE DETECTADO");
+            solicitarEnvioTelemetria = true; 
+        }
+
+        if (bloqueoFraude) {
+            if (ahora - tiempoFraude >= BLOQUEO) {
+                bloqueoFraude = false;
+                estado = "CLEAN";
+                ultimoPulso = ahora; 
+
+                reporte("FRAUDE LIBERADO");
+                solicitarEnvioTelemetria = true; 
+            }
+        }
+    }
+
+    //========= DISPARO DE TELEMETRÍA POR EVENTO ==========
+    if (solicitarEnvioTelemetria) {
+        solicitarEnvioTelemetria = false; 
+        enviarTelemetriaNakamura();      
+    }
+}
