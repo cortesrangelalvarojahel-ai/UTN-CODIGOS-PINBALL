@@ -1,0 +1,273 @@
+#include <Arduino.h>
+#include <WiFi.h>
+
+// --- Configuración de Pines ---
+const int PIN_MONEDA = 4;           
+const int PIN_APAGAR_LED = 18;      
+const int PIN_PARO_EMERGENCIA = 19; // Funciona como paro/control del sistema
+const int PIN_HOPPER_MOTOR = 23;    
+const int PIN_HOPPER_SENSOR = 17;   // Validación física de entrega del Hopper
+const int PIN_LED_DEVOLUCION = 2;   
+
+// --- Tiempos y Filtros (Anti-pesca / Monedas) ---
+const unsigned long T_MIN_PULSO = 20;    
+const unsigned long T_MAX_PULSO = 150;   
+const unsigned long T_INTERVALO = 100;   
+
+volatile bool monedaDetectada = false;
+volatile unsigned long ultimoPulsoValido = 0;
+
+// --- Control de Caja e Históricos ---
+int totalEntregadoHistorico = 0; // Acumulador histórico infinito desde 0
+int totalDevueltoHistorico = 0;   
+bool esperandoValidacionHopper = false; 
+String statusSeguridad = "CLEAN"; 
+
+// --- Temporizadores Asíncronos (millis) ---
+unsigned long tiempoInicioPago = 0;
+const unsigned long TIMEOUT_HOPPER_SEGURIDAD = 4000; 
+
+unsigned long tiempoUltimoFraudeAutomatico = 0;
+const unsigned long INTERVALO_FRAUDE_AUTOMATICO = 60000; 
+
+unsigned long tiempoInicioBloqueo = 0;
+const unsigned long DURACION_BLOQUEO = 3000; 
+
+bool ejecucionDevolucionActiva = false;
+unsigned long tiempoInicioDevolucion = 0;
+const unsigned long DURACION_PULSO_DEVOLUCION = 500; 
+
+String cadenaComando = "";
+
+// --- Red y Conectividad (Nakamura Logistic) ---
+const char* SSID_WIFI = "Wokwi-GUEST"; 
+const char* PASS_WIFI = "";
+unsigned long tiempoUltimoIntentoWiFi = 0;
+const unsigned long INTERVALO_RECONEXION_WIFI = 5000; 
+
+// REFACTORIZACIÓN SEMANA 9: Latencia de reporte teórica menor a 1 segundo (800 ms)
+unsigned long tiempoUltimoEnvioTelemetria = 0;
+const unsigned long INTERVALO_TELEMETRIA = 800; 
+
+// --- Interrupción por Hardware (ISR) ---
+void IRAM_ATTR verificarMonedaISR() {
+    unsigned long t_actual = millis();
+    if (esperandoValidacionHopper || statusSeguridad != "CLEAN") return;
+
+    if (t_actual - ultimoPulsoValido >= T_INTERVALO) {
+        monedaDetectada = true;
+        ultimoPulsoValido = t_actual;
+    }
+}
+
+// --- Reportes Estructurados por Serial ---
+void imprimirReporteEstructurado(String evento) {
+    Serial.println("\n=========================================");
+    Serial.print("EVENTO: "); Serial.println(evento);
+    Serial.println("-----------------------------------------");
+    Serial.print(" -> TOTAL EN CAJA HISTÓRICO: $"); Serial.println(totalEntregadoHistorico);
+    Serial.print(" -> TOTAL DEVOLUCIÓN HISTÓRICO: $"); Serial.println(totalDevueltoHistorico);
+    Serial.print(" -> Estado del Hopper Motor:  "); Serial.println(digitalRead(PIN_HOPPER_MOTOR) == HIGH ? "ENCENDIDO" : "APAGADO");
+    Serial.print(" -> Estado Devolución LED:    "); Serial.println(digitalRead(PIN_LED_DEVOLUCION) == HIGH ? "ENCENDIDO" : "APAGADO");
+    Serial.print(" -> Security Engine Status:   "); Serial.println(statusSeguridad);
+    Serial.print(" -> WiFi Status:              "); Serial.println(WiFi.status() == WL_CONNECTED ? "CONECTADO" : "DESCONECTADO");
+    Serial.println("=========================================");
+}
+
+// --- Gestión de WiFi Asíncrona ---
+void gestionarWiFiAsincrono(unsigned long tiempoActual) {
+    if (WiFi.status() != WL_CONNECTED) {
+        if (tiempoActual - tiempoUltimoIntentoWiFi >= INTERVALO_RECONEXION_WIFI) {
+            tiempoUltimoIntentoWiFi = tiempoActual;
+            Serial.println("\n[WIFI]: Buscando red Nakamura Logistic...");
+            WiFi.begin(SSID_WIFI, PASS_WIFI); 
+        }
+    }
+    
+    static wl_status_t estadoAnteriorWiFi = WL_DISCONNECTED; 
+    int estadoActualWiFi = WiFi.status();
+    if (estadoActualWiFi == WL_CONNECTED && estadoAnteriorWiFi != WL_CONNECTED) {
+        Serial.print("\n[WIFI]: Conectado. IP: ");
+        Serial.println(WiFi.localIP());
+    }
+    estadoAnteriorWiFi = (wl_status_t)estadoActualWiFi;
+}
+
+// --- Transmisión de Telemetría (Menor a 1s de latencia) ---
+void enviarTelemetriaNakamura(unsigned long tiempoActual) {
+    if (WiFi.status() == WL_CONNECTED) {
+        if (tiempoActual - tiempoUltimoEnvioTelemetria >= INTERVALO_TELEMETRIA) {
+            tiempoUltimoEnvioTelemetria = tiempoActual;
+            
+            Serial.println("\n>>> NAKAMURA LOGISTIC - TRANSMISIÓN <<<");
+            Serial.print(" -> JSON: { \"caja_historica\": "); Serial.print(totalEntregadoHistorico);
+            Serial.print(", \"total_devuelto\": "); Serial.print(totalDevueltoHistorico);
+            Serial.print(", \"status_seguridad\": \""); Serial.print(statusSeguridad);
+            String JSON_PULSO = "\" }";
+            Serial.println(JSON_PULSO);
+            Serial.println("---------------------------------------");
+        }
+    }
+}
+
+// --- Procesamiento de Comandos desde Consola ---
+void procesarComandosRemotos() {
+    while (Serial.available() > 0) {
+        char caracter = Serial.read();
+        if (caracter == '\n' || caracter == '\r') {
+            cadenaComando.trim(); 
+            
+            if (cadenaComando.equalsIgnoreCase("LOCK")) {
+                if (statusSeguridad != "REMOTE_LOCKED") {
+                    statusSeguridad = "REMOTE_LOCKED";
+                    digitalWrite(PIN_HOPPER_MOTOR, LOW); 
+                    digitalWrite(PIN_LED_DEVOLUCION, LOW);
+                    esperandoValidacionHopper = false;
+                    ejecucionDevolucionActiva = false;
+                    imprimirReporteEstructurado("BLOQUEO_REMOTO_ADMINISTRADOR");
+                }
+            } 
+            else if (cadenaComando.equalsIgnoreCase("UNLOCK")) {
+                if (statusSeguridad == "REMOTE_LOCKED") {
+                    statusSeguridad = "CLEAN";
+                    monedaDetectada = false; 
+                    imprimirReporteEstructurado("DESBLOQUEO_REMOTO_ADMINISTRADOR");
+                }
+            }
+            else if (cadenaComando.length() > 0) {
+                Serial.print("\n[ERROR]: Comando '"); Serial.print(cadenaComando); Serial.println("' inválido.");
+            }
+            cadenaComando = ""; 
+        } else {
+            cadenaComando += caracter; 
+        }
+    }
+}
+
+// --- Validación de Entrega ---
+void verificarYRegistrarEntrega() {
+    totalEntregadoHistorico += 1;
+    esperandoValidacionHopper = false;   
+    
+    if (totalEntregadoHistorico % 5 == 0) {
+        totalDevueltoHistorico += 1;
+        ejecucionDevolucionActiva = true;
+        tiempoInicioDevolucion = millis();
+        digitalWrite(PIN_LED_DEVOLUCION, HIGH);
+        imprimirReporteEstructurado("PROCESANDO_ENTREGA_Y_DEVOLUCION_5_PESOS");
+    } else {
+        imprimirReporteEstructurado("PAGO_Y_ENTREGA_VALIDADA_CORRECTAMENTE");
+    }
+}
+
+void setup() {
+    Serial.begin(115200);
+    
+    pinMode(PIN_MONEDA, INPUT_PULLUP);
+    pinMode(PIN_APAGAR_LED, INPUT_PULLUP);
+    pinMode(PIN_PARO_EMERGENCIA, INPUT_PULLUP); 
+    pinMode(PIN_HOPPER_SENSOR, INPUT);  
+    pinMode(PIN_LED_DEVOLUCION, OUTPUT);
+    
+    pinMode(PIN_HOPPER_MOTOR, OUTPUT);
+    digitalWrite(PIN_HOPPER_MOTOR, LOW); 
+    digitalWrite(PIN_LED_DEVOLUCION, LOW);
+    
+    attachInterrupt(digitalPinToInterrupt(PIN_MONEDA), verificarMonedaISR, FALLING);
+    WiFi.mode(WIFI_STA);
+    
+    imprimirReporteEstructurado("SISTEMA_REINICIADO");
+}
+
+void loop() {
+    unsigned long tiempoActual = millis();
+
+    // Tareas concurrentes y no bloqueantes
+    procesarComandosRemotos();
+    gestionarWiFiAsincrono(tiempoActual);
+    enviarTelemetriaNakamura(tiempoActual);
+
+    // Máquina de estados / Lógica de tiempos
+    if (ejecucionDevolucionActiva) {
+        if (tiempoActual - tiempoInicioDevolucion >= DURACION_PULSO_DEVOLUCION) {
+            digitalWrite(PIN_LED_DEVOLUCION, LOW);
+            ejecucionDevolucionActiva = false;
+            imprimirReporteEstructurado("DEVOLUCION_COMPLETADA_EXITOSAMENTE");
+        }
+    }
+
+    if (statusSeguridad == "CLEAN" && !esperandoValidacionHopper) {
+        if (tiempoActual - tiempoUltimoFraudeAutomatico >= INTERVALO_FRAUDE_AUTOMATICO) {
+            tiempoUltimoFraudeAutomatico = tiempoActual;
+            statusSeguridad = "FRAUD_DETECTED";
+            digitalWrite(PIN_HOPPER_MOTOR, LOW);
+            digitalWrite(PIN_LED_DEVOLUCION, LOW);
+            tiempoInicioBloqueo = tiempoActual;
+            imprimirReporteEstructurado("ALERTA_FRAUDE");
+        }
+    }
+
+    // Monitoreo del Paro de Emergencia
+    int estadoActualParO = digitalRead(PIN_PARO_EMERGENCIA);
+    static int estadoAnteriorParo = HIGH;
+    static unsigned long tiempoUltimoCambioParo = 0;
+
+    if (estadoActualParO == LOW && estadoAnteriorParo == HIGH) {
+        if (tiempoActual - tiempoUltimoCambioParo > 300) { 
+            if (statusSeguridad != "REMOTE_LOCKED") {
+                if (statusSeguridad != "EMERGENCY_STOPPED") {
+                    statusSeguridad = "EMERGENCY_STOPPED";
+                    digitalWrite(PIN_HOPPER_MOTOR, LOW); 
+                    digitalWrite(PIN_LED_DEVOLUCION, LOW);
+                    esperandoValidacionHopper = false;
+                    ejecucionDevolucionActiva = false;
+                    imprimirReporteEstructurado("PARO_DE_EMERGENCIA_ACTIVADO");
+                } else {
+                    statusSeguridad = "CLEAN";
+                    monedaDetectada = false; 
+                    tiempoUltimoFraudeAutomatico = tiempoActual;
+                    imprimirReporteEstructurado("PARO_DE_EMERGENCIA_LIBERADO");
+                }
+            }
+            tiempoUltimoCambioParo = tiempoActual;
+        }
+    }
+    estadoAnteriorParo = estadoActualParO;
+
+    // Control de Motor y Sensores
+    if (statusSeguridad != "EMERGENCY_STOPPED" && statusSeguridad != "REMOTE_LOCKED") {
+        if (monedaDetectada) {
+            monedaDetectada = false; 
+            esperandoValidacionHopper = true; 
+            tiempoInicioPago = tiempoActual; 
+            
+            digitalWrite(PIN_HOPPER_MOTOR, HIGH); 
+            imprimirReporteEstructurado("MONEDA_DETECTADA_MOTOR_ENCENDIDO");
+        }
+
+        if (esperandoValidacionHopper) {
+            if (digitalRead(PIN_HOPPER_SENSOR) == HIGH) {
+                digitalWrite(PIN_HOPPER_MOTOR, LOW); 
+                verificarYRegistrarEntrega();
+            }
+            else if (digitalRead(PIN_APAGAR_LED) == LOW) {
+                digitalWrite(PIN_HOPPER_MOTOR, LOW);
+                verificarYRegistrarEntrega();
+            }
+            else if (tiempoActual - tiempoInicioPago >= TIMEOUT_HOPPER_SEGURIDAD) {
+                digitalWrite(PIN_HOPPER_MOTOR, LOW);
+                esperandoValidacionHopper = false;
+                imprimirReporteEstructurado("TIMEOUT_HOPPER_ERROR_SIN_MONEDAS");
+            }
+        }
+
+        if (statusSeguridad == "FRAUD_DETECTED") {
+            if (tiempoActual - tiempoInicioBloqueo >= DURACION_BLOQUEO) {
+                statusSeguridad = "CLEAN";
+                monedaDetectada = false;
+                tiempoUltimoFraudeAutomatico = tiempoActual;
+                Serial.println("\n[SECURITY]: Penalizacion finalizada.");
+            }
+        }
+    }
+}
