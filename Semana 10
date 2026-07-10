@@ -1,0 +1,351 @@
+#include <Arduino.h>
+#include <WiFi.h>
+#include <HTTPClient.h>
+
+// =========================================================================
+// 🧪 CONFIGURACIÓN DE PRUEBA: SCRIPT DE INYECCIÓN DE SEÑALES (SEMANA 10)
+// =========================================================================
+// Descomenta la siguiente línea para activar el generador de pulsos de alta frecuencia
+#define MODO_TEST_INYECTOR 
+
+#ifdef MODO_TEST_INYECTOR
+  const int PIN_INYECTOR_TEST = 5; // Conectado físicamente con el cable verde al PIN 15 en Wokwi
+  unsigned long tiempoUltimoPulsoInyector = 0;
+  unsigned long tiempoInicioRafagaTest = 0;
+  bool rafagaTestActiva = false;
+  int pulsosInyectadosContador = 0;
+#endif
+
+// --- Configuración de Pines ---
+const int PIN_MONEDA = 15;          // Pin 15 asignado para la lectura de monedas y pruebas
+const int PIN_APAGAR_LED = 18;      // Botón Amarillo: Apaga de inmediato el motor/proceso
+const int PIN_PARO_EMERGENCIA = 19; // Botón Rojo: Paro de emergencia total (Toggle)
+const int PIN_HOPPER_MOTOR = 23;    
+const int PIN_HOPPER_SENSOR = 17;   // Validación física de entrega del Hopper
+const int PIN_LED_DEVOLUCION = 2;   // LED Local: Indicador de cambio de $5
+
+// LED Exigido por la guía de la semana 10 (Color Rosa en tu simulación)
+const int PIN_LED_IOT = 16;         // LED IoT: Controlado desde el Backend (GET)
+
+// --- Tiempos y Filtros ---
+const unsigned long T_INTERVALO = 50;   // Filtro optimizado a 50ms para asegurar lecturas en Pin 15
+volatile bool monedaDetectada = false;
+volatile unsigned long ultimoPulsoValido = 0;
+
+// --- Control de Caja e Históricos ---
+int totalEntregadoHistorico = 0; 
+int totalDevueltoHistorico = 0;   
+bool esperandoValidacionHopper = false; 
+String statusSeguridad = "CLEAN"; 
+
+// --- Temporizadores Asíncronos (millis) ---
+unsigned long tiempoInicioPago = 0;
+const unsigned long TIMEOUT_HOPPER_SEGURIDAD = 4000; 
+
+unsigned long tiempoUltimoFraudeAutomatico = 0;
+const unsigned long INTERVALO_FRAUDE_AUTOMATICO = 60000; 
+
+unsigned long tiempoInicioBloqueo = 0;
+const unsigned long DURACION_BLOQUEO = 3000; 
+
+bool ejecucionDevolucionActiva = false;
+unsigned long tiempoInicioDevolucion = 0;
+const unsigned long DURACION_PULSO_DEVOLUCION = 500; 
+
+String cadenaComando = "";
+
+// --- Red y Conectividad REST ---
+const char* SSID_WIFI = "Wokwi-GUEST"; // Red virtual de Wokwi
+const char* PASS_WIFI = "";
+unsigned long tiempoUltimoIntentoWiFi = 0;
+const unsigned long INTERVALO_RECONEXION_WIFI = 5000; 
+
+// =========================================================================
+// 🌐 URL ESTÁNDAR PARA API REST LOCAL (SEMANA 10)
+// =========================================================================
+const char* URL_BASE = "http://localhost:3000/api";
+
+unsigned long tiempoUltimoEnvioTelemetria = 0;
+const unsigned long INTERVALO_TELEMETRIA = 1500; // Sincronización POST cada 1.5s
+
+unsigned long tiempoUltimoGET = 0;
+const unsigned long INTERVALO_GET = 2500; // Consulta GET cada 2.5s
+
+// --- Interrupción por Hardware (ISR) ---
+void IRAM_ATTR verificarMonedaISR() {
+    unsigned long t_actual = millis();
+    // Permitir la lectura si estamos en modo test o si el sistema está limpio
+    if (esperandoValidacionHopper && statusSeguridad != "CLEAN") return;
+
+    if (t_actual - ultimoPulsoValido >= T_INTERVALO) {
+        monedaDetectada = true;
+        ultimoPulsoValido = t_actual;
+    }
+}
+
+// --- Reportes Estructurados por Serial ---
+void imprimirReporteEstructurado(String evento) {
+    Serial.println("\n=========================================");
+    Serial.print("EVENTO: "); Serial.println(evento);
+    Serial.println("-----------------------------------------");
+    Serial.print(" -> TOTAL EN CAJA HISTÓRICO: $"); Serial.println(totalEntregadoHistorico);
+    Serial.print(" -> TOTAL DEVOLUCIÓN HISTÓRICO: $"); Serial.println(totalDevueltoHistorico);
+    Serial.print(" -> Estado del Hopper Motor:  "); Serial.println(digitalRead(PIN_HOPPER_MOTOR) == HIGH ? "ENCENDIDO" : "APAGADO");
+    Serial.print(" -> Security Engine Status:   "); Serial.println(statusSeguridad);
+    Serial.println("=========================================");
+}
+
+// --- Gestión de WiFi Asíncrona ---
+void gestionarWiFiAsincrono(unsigned long tiempoActual) {
+    static wl_status_t ultimoEstadoWiFi = WL_NO_SHIELD;
+    wl_status_t estadoActualWiFi = WiFi.status();
+
+    if (estadoActualWiFi != ultimoEstadoWiFi) {
+        if (estadoActualWiFi == WL_CONNECTED) {
+            Serial.print("\n[WIFI] ¡Conectado con éxito! IP Asignada: ");
+            Serial.println(WiFi.localIP());
+        } else if (estadoActualWiFi == WL_DISCONNECTED) {
+            Serial.println("\n[WIFI] Desconectado de la red.");
+        }
+        ultimoEstadoWiFi = estadoActualWiFi;
+    }
+
+    if (estadoActualWiFi != WL_CONNECTED) {
+        if (tiempoActual - tiempoUltimoIntentoWiFi >= INTERVALO_RECONEXION_WIFI) {
+            tiempoUltimoIntentoWiFi = tiempoActual;
+            Serial.println("[WIFI] Reintentando conectar a Wokwi-GUEST...");
+            WiFi.begin(SSID_WIFI, PASS_WIFI); 
+        }
+    }
+}
+
+// --- Enviar Telemetría (HTTP POST) con Reportes Visuales ---
+void enviarTelemetriaREST(unsigned long tiempoActual) {
+    if (tiempoActual - tiempoUltimoEnvioTelemetria >= INTERVALO_TELEMETRIA) {
+        tiempoUltimoEnvioTelemetria = tiempoActual;
+        
+        if (WiFi.status() == WL_CONNECTED) {
+            HTTPClient http;
+            http.begin(String(URL_BASE) + "/sensores");
+            http.addHeader("Content-Type", "application/json");
+            
+            String jsonPayload = "{\"caja_historica\":" + String(totalEntregadoHistorico) + 
+                                 ",\"total_devuelto\":" + String(totalDevueltoHistorico) + 
+                                 ",\"status_seguridad\":\"" + statusSeguridad + "\"}";
+            
+            Serial.print("[HTTP POST] Enviando datos... ");
+            int codigoRespuesta = http.POST(jsonPayload);
+            Serial.print("Código Servidor: "); Serial.println(codigoRespuesta);
+            http.end(); 
+        } else {
+            Serial.println("[HTTP POST] Saltado: WiFi desconectado.");
+        }
+    }
+}
+
+// --- Consultar Actuador de Servidor (HTTP GET) con Monitoreo de LED ---
+void consultarEstadoRemotoGET(unsigned long tiempoActual) {
+    if (tiempoActual - tiempoUltimoGET >= INTERVALO_GET) {
+        tiempoUltimoGET = tiempoActual;
+        
+        if (WiFi.status() == WL_CONNECTED) {
+            HTTPClient http;
+            http.begin(String(URL_BASE) + "/actuadores/led1");
+            
+            Serial.print("[HTTP GET] Consultando API... ");
+            int codigoRespuesta = http.GET();
+            Serial.print("Código Servidor: "); Serial.println(codigoRespuesta);
+            
+            if (codigoRespuesta == 200) {
+                String respuesta = http.getString();
+                Serial.println("[HTTP GET] Respuesta JSON: " + respuesta);
+                
+                if (respuesta.indexOf("\"encendido\":true") != -1) {
+                    digitalWrite(PIN_LED_IOT, HIGH); 
+                    
+                    if (statusSeguridad != "REMOTE_LOCKED") {
+                        statusSeguridad = "REMOTE_LOCKED";
+                        digitalWrite(PIN_HOPPER_MOTOR, LOW); 
+                        digitalWrite(PIN_LED_DEVOLUCION, LOW);
+                        esperandoValidacionHopper = false;
+                        imprimirReporteEstructurado("BLOQUEO_DESDE_API_REST_ACTIVADO");
+                    }
+                } else {
+                    digitalWrite(PIN_LED_IOT, LOW); 
+                    if (statusSeguridad == "REMOTE_LOCKED") {
+                        statusSeguridad = "CLEAN";
+                        imprimirReporteEstructurado("SISTEMA_RESTABLECIDO_DESDE_API_REST");
+                    }
+                }
+            }
+            http.end(); 
+        } else {
+            Serial.println("[HTTP GET] Saltado: WiFi sin conexión.");
+        }
+    }
+}
+
+void verificarYRegistrarEntrega() {
+    totalEntregadoHistorico += 1;
+    esperandoValidacionHopper = false;   
+    
+    if (totalEntregadoHistorico % 5 == 0) {
+        totalDevueltoHistorico += 1;
+        ejecucionDevolucionActiva = true;
+        tiempoInicioDevolucion = millis();
+        digitalWrite(PIN_LED_DEVOLUCION, HIGH);
+        imprimirReporteEstructurado("DEVOLUCION_5_PESOS_ACTIVADA");
+    } else {
+        imprimirReporteEstructurado("ENTREGA_CONFIRMADA");
+    }
+}
+
+// --- Script Inyector de Señales Asíncrono (Alta Frecuencia) ---
+void gestionarInyectorTest(unsigned long tiempoActual) {
+#ifdef MODO_TEST_INYECTOR
+    // Activa una ráfaga automática de estrés cada 30 segundos
+    if (!rafagaTestActiva && (tiempoActual - tiempoInicioRafagaTest >= 30000)) {
+        rafagaTestActiva = true;
+        tiempoInicioRafagaTest = tiempoActual;
+        pulsosInyectadosContador = 0;
+        pinMode(PIN_INYECTOR_TEST, OUTPUT); // Tomar control eléctrico de la línea
+        Serial.println("\n[INYECTOR TEST] ¡Iniciando ráfaga de alta frecuencia para estresar la ISR!");
+    }
+
+    if (rafagaTestActiva) {
+        // Genera una onda cuadrada rápida (Cada 4ms cambia de estado = ~125Hz)
+        if (tiempoActual - tiempoUltimoPulsoInyector >= 4) {
+            tiempoUltimoPulsoInyector = tiempoActual;
+            int estadoActual = digitalRead(PIN_INYECTOR_TEST);
+            digitalWrite(PIN_INYECTOR_TEST, !estadoActual);
+            
+            if (estadoActual == LOW) {
+                pulsosInyectadosContador++;
+            }
+
+            // Terminar la ráfaga tras inyectar 15 pulsos rápidos de prueba
+            if (pulsosInyectadosContador >= 15) {
+                rafagaTestActiva = false;
+                // Soltar la línea eléctrica para permitir que tu botón físico vuelva a funcionar perfectamente
+                pinMode(PIN_INYECTOR_TEST, INPUT_PULLUP); 
+                Serial.print("[INYECTOR TEST] Ráfaga finalizada. Pulsos detectados en este ciclo.");
+            }
+        }
+    }
+#endif
+}
+
+void setup() {
+    Serial.begin(115200);
+    
+    // Configuración reforzada para asegurar que el Pin 15 lea correctamente los pulsos físicos
+    pinMode(PIN_MONEDA, INPUT_PULLUP);
+    pinMode(PIN_APAGAR_LED, INPUT_PULLUP);
+    pinMode(PIN_PARO_EMERGENCIA, INPUT_PULLUP); 
+    pinMode(PIN_HOPPER_SENSOR, INPUT);  
+    pinMode(PIN_LED_DEVOLUCION, OUTPUT);
+    pinMode(PIN_LED_IOT, OUTPUT); 
+    pinMode(PIN_HOPPER_MOTOR, OUTPUT);
+    
+    digitalWrite(PIN_HOPPER_MOTOR, LOW); 
+    digitalWrite(PIN_LED_DEVOLUCION, LOW);
+    digitalWrite(PIN_LED_IOT, LOW);
+
+#ifdef MODO_TEST_INYECTOR
+    // Iniciamos en alta impedancia para no pisar el botón verde al arrancar
+    pinMode(PIN_INYECTOR_TEST, INPUT_PULLUP);
+#endif
+    
+    attachInterrupt(digitalPinToInterrupt(PIN_MONEDA), verificarMonedaISR, FALLING);
+    
+    WiFi.mode(WIFI_STA);
+    Serial.println("[WIFI] Inicializando conexión a Wokwi-GUEST...");
+    WiFi.begin(SSID_WIFI, PASS_WIFI); 
+    
+    imprimirReporteEstructurado("SISTEMA_INICIALIZADO");
+}
+
+void loop() {
+    unsigned long tiempoActual = millis();
+
+    // Lógica del Inyector de Pruebas (Rúbrica Semana 10)
+    gestionarInyectorTest(tiempoActual);
+
+    // 1. LECTURA INMEDIATA Y PRIORITARIA DE BOTONES CRÍTICOS
+    int estadoActualParo = digitalRead(PIN_PARO_EMERGENCIA); 
+    static int estadoAnteriorParo = HIGH;
+    static unsigned long tiempoUltimoCambioParo = 0;
+
+    if (estadoActualParo == LOW && estadoAnteriorParo == HIGH && (tiempoActual - tiempoUltimoCambioParo > 200)) { 
+        tiempoUltimoCambioParo = tiempoActual;
+        if (statusSeguridad != "EMERGENCY_STOPPED") {
+            statusSeguridad = "EMERGENCY_STOPPED";
+            digitalWrite(PIN_HOPPER_MOTOR, LOW); 
+            digitalWrite(PIN_LED_DEVOLUCION, LOW);
+            esperandoValidacionHopper = false;
+            ejecucionDevolucionActiva = false;
+            imprimirReporteEstructurado("PARO_TOTAL_FORZADO");
+        } else {
+            statusSeguridad = "CLEAN";
+            monedaDetectada = false; 
+            tiempoUltimoFraudeAutomatico = tiempoActual;
+            imprimirReporteEstructurado("SISTEMA_LIBERADO");
+        }
+    }
+    estadoAnteriorParo = estadoActualParo; 
+
+    if (digitalRead(PIN_APAGAR_LED) == LOW && esperandoValidacionHopper) {
+        digitalWrite(PIN_HOPPER_MOTOR, LOW);
+        verificarYRegistrarEntrega();
+    }
+
+    // 2. CONTROL DE EVENTOS LOCALES (MONEDAS Y MOTORES)
+    if (statusSeguridad == "CLEAN") {
+        if (monedaDetectada) {
+            monedaDetectada = false; 
+            esperandoValidacionHopper = true; 
+            tiempoInicioPago = tiempoActual; 
+            digitalWrite(PIN_HOPPER_MOTOR, HIGH); 
+            imprimirReporteEstructurado("MONEDA_ENTRANTE_MOTOR_ON");
+        }
+
+        if (esperandoValidacionHopper) {
+            if (digitalRead(PIN_HOPPER_SENSOR) == HIGH) {
+                digitalWrite(PIN_HOPPER_MOTOR, LOW); 
+                verificarYRegistrarEntrega();
+            }
+            else if (tiempoActual - tiempoInicioPago >= TIMEOUT_HOPPER_SEGURIDAD) {
+                digitalWrite(PIN_HOPPER_MOTOR, LOW);
+                esperandoValidacionHopper = false;
+                imprimirReporteEstructurado("TIMEOUT_HOPPER_SIN_MONEDAS_ERROR");
+            }
+        }
+    }
+
+    if (ejecucionDevolucionActiva && (tiempoActual - tiempoInicioDevolucion >= DURACION_PULSO_DEVOLUCION)) {
+        digitalWrite(PIN_LED_DEVOLUCION, LOW);
+        ejecucionDevolucionActiva = false;
+    }
+
+    if (statusSeguridad == "CLEAN" && !esperandoValidacionHopper) {
+        if (tiempoActual - tiempoUltimoFraudeAutomatico >= INTERVALO_FRAUDE_AUTOMATICO) {
+            tiempoUltimoFraudeAutomatico = tiempoActual;
+            statusSeguridad = "FRAUD_DETECTED";
+            digitalWrite(PIN_HOPPER_MOTOR, LOW);
+            digitalWrite(PIN_LED_DEVOLUCION, LOW);
+            tiempoInicioBloqueo = tiempoActual;
+            imprimirReporteEstructurado("ALERTA_FRAUDE_SIMULADO");
+        }
+    }
+
+    if (statusSeguridad == "FRAUD_DETECTED" && (tiempoActual - tiempoInicioBloqueo >= DURACION_BLOQUEO)) {
+        statusSeguridad = "CLEAN";
+        monedaDetectada = false;
+        tiempoUltimoFraudeAutomatico = tiempoActual;
+    }
+
+    // 3. CONECTIVIDAD DE RED Y ENTRADA/SALIDA REST (Asíncronas por millis)
+    gestionarWiFiAsincrono(tiempoActual);
+    enviarTelemetriaREST(tiempoActual);
+    consultarEstadoRemotoGET(tiempoActual);
+}
