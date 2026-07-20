@@ -1,4 +1,4 @@
-# Sistema de Monitoreo IoT para Máquina de Pinball
+# Sistema de Monitoreo IoT para Máquina de Pinball.
 **Desarrollado para:** Nakamura Logistic | Versión 1.0 (Etapa Final)
 
 Este repositorio contiene el firmware definitivo y la documentación técnica para el sistema automatizado de auditoría, control de flujo de efectivo y seguridad perimetral basado en el microcontrolador ESP32.
